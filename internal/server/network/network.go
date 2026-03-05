@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 
@@ -18,6 +19,9 @@ const maxMessageSize = 64 * 1024 // 64KB
 // NetworkConfig holds configuration for the network server.
 type NetworkConfig struct {
 	Port int
+	// Listener, if set, is used instead of opening a new one on Port.
+	// This eliminates the TOCTOU race between finding a free port and binding it.
+	Listener net.Listener
 }
 
 // connEntry pairs a WebSocket connection with its write mutex.
@@ -30,14 +34,15 @@ type connEntry struct {
 
 // NetworkServer manages WebSocket connections and message routing.
 type NetworkServer struct {
-	upgrader      websocket.Upgrader
-	clients       map[string]*connEntry
-	mu            sync.RWMutex
-	config        NetworkConfig
-	server        *http.Server
-	onConnHandler func(conn *websocket.Conn)
-	onDiscHandler func(playerId string)
-	onMsgHandler  func(playerId string, msg protocol.ClientMessage)
+	upgrader            websocket.Upgrader
+	clients             map[string]*connEntry
+	mu                  sync.RWMutex
+	config              NetworkConfig
+	server              *http.Server
+	onConnHandler       func(conn *websocket.Conn)
+	onDiscHandler       func(playerId string)
+	onMsgHandler        func(playerId string, msg protocol.ClientMessage)
+	onUnboundMsgHandler func(conn *websocket.Conn, msg protocol.ClientMessage)
 }
 
 // NewNetworkServer creates a new NetworkServer with the given config.
@@ -53,22 +58,39 @@ func NewNetworkServer(config NetworkConfig) *NetworkServer {
 
 // Start begins the HTTP server in a background goroutine, serving WebSocket
 // connections at /ws/{roomCode}.
+// If config.Listener is set, it is used directly (avoids TOCTOU port races).
+// Otherwise a new listener is opened on config.Port.
 func (ns *NetworkServer) Start(roomCode string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc(fmt.Sprintf("/ws/%s", roomCode), ns.HandleConnection)
 
 	ns.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", ns.config.Port),
 		Handler: mux,
 	}
 
+	ln := ns.config.Listener
+	if ln == nil {
+		var err error
+		ln, err = net.Listen("tcp", fmt.Sprintf(":%d", ns.config.Port))
+		if err != nil {
+			return fmt.Errorf("network: listen failed: %w", err)
+		}
+	}
+	// Record the actual port (useful when Port was 0).
+	ns.config.Port = ln.Addr().(*net.TCPAddr).Port
+
 	go func() {
-		if err := ns.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := ns.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			slog.Error("network server error", "error", err)
 		}
 	}()
 
 	return nil
+}
+
+// Port returns the port the server is listening on.
+func (ns *NetworkServer) Port() int {
+	return ns.config.Port
 }
 
 // Stop gracefully shuts down the HTTP server.
@@ -92,6 +114,12 @@ func (ns *NetworkServer) OnDisconnection(handler func(playerId string)) {
 // OnMessage registers a handler called when a message is received from a player.
 func (ns *NetworkServer) OnMessage(handler func(playerId string, msg protocol.ClientMessage)) {
 	ns.onMsgHandler = handler
+}
+
+// OnUnboundMessage registers a handler called when a message is received from
+// a connection that has not yet been bound to a player ID (e.g. "join").
+func (ns *NetworkServer) OnUnboundMessage(handler func(conn *websocket.Conn, msg protocol.ClientMessage)) {
+	ns.onUnboundMsgHandler = handler
 }
 
 // SendTo sends a JSON message to a specific player.
@@ -241,6 +269,8 @@ func (ns *NetworkServer) readLoop(conn *websocket.Conn) {
 		playerID := findPlayerID()
 		if playerID != "" && ns.onMsgHandler != nil {
 			ns.onMsgHandler(playerID, msg)
+		} else if playerID == "" && ns.onUnboundMsgHandler != nil {
+			ns.onUnboundMsgHandler(conn, msg)
 		}
 	}
 }

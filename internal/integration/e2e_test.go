@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -280,50 +279,17 @@ type serverStack struct {
 	connCh chan *websocket.Conn
 }
 
-// freePort picks an unused TCP port on loopback.
-// It binds, records the port, closes the listener, and returns the port.
-// There is an inherent TOCTOU race between closing and the caller binding,
-// but in practice this window is negligible in test environments.
-func freePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freePort: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
-	return port
-}
-
-// waitServerReady dials the server in a loop until it accepts a connection or
-// the deadline expires.  This avoids flakiness from the TOCTOU gap between
-// freePort releasing the port and the HTTP server binding it.
-func waitServerReady(t *testing.T, port int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("server on port %d did not become ready within 2s", port)
-}
-
 // buildStack wires all server components together with the mock AI provider.
 func buildStack(t *testing.T) *serverStack {
 	t.Helper()
 
-	port := freePort(t)
 	ai := newMockAI()
 
 	// 1. EventBus
 	bus := eventbus.NewEventBus()
 
-	// 2. NetworkServer
-	netSrv := network.NewNetworkServer(network.NetworkConfig{Port: port})
+	// 2. NetworkServer — use port 0 so the OS picks a free port atomically.
+	netSrv := network.NewNetworkServer(network.NetworkConfig{Port: 0})
 
 	// 3. MapEngine
 	me := mapengine.NewMapEngine()
@@ -397,8 +363,7 @@ func buildStack(t *testing.T) *serverStack {
 		t.Fatalf("NetworkServer.Start: %v", err)
 	}
 
-	// Wait until the HTTP server is ready to accept connections.
-	waitServerReady(t, port)
+	port := netSrv.Port()
 
 	return &serverStack{
 		net:        netSrv,

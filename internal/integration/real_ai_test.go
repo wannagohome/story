@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,30 +35,6 @@ func getAPIKeyFromDoppler(name string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
-}
-
-func freePortForRealAI() int {
-	l, err := net.Listen("tcp", ":0")
-	if err != nil {
-		panic(err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
-	return port
-}
-
-func waitServerReadyRealAI(t *testing.T, port int) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", port), 100*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal("server did not become ready")
 }
 
 func strPtr(s string) *string { return &s }
@@ -165,9 +140,8 @@ type realAIStack struct {
 func buildRealAIStack(t *testing.T, aiLayer *ai.AILayer) *realAIStack {
 	t.Helper()
 
-	port := freePortForRealAI()
 	bus := eventbus.NewEventBus()
-	netSrv := network.NewNetworkServer(network.NetworkConfig{Port: port})
+	netSrv := network.NewNetworkServer(network.NetworkConfig{Port: 0})
 	me := mapengine.NewMapEngine()
 	gs := game.NewGameStateManager(bus, me)
 	sm := session.NewSessionManager(netSrv, bus, gs, aiLayer)
@@ -204,7 +178,6 @@ func buildRealAIStack(t *testing.T, aiLayer *ai.AILayer) *realAIStack {
 	if err := netSrv.Start(roomCode); err != nil {
 		t.Fatalf("server start failed: %v", err)
 	}
-	waitServerReadyRealAI(t, port)
 
 	return &realAIStack{
 		net:        netSrv,
@@ -215,7 +188,7 @@ func buildRealAIStack(t *testing.T, aiLayer *ai.AILayer) *realAIStack {
 		endEngine:  ece,
 		msgRouter:  mr,
 		actionProc: ap,
-		port:       port,
+		port:       netSrv.Port(),
 		roomCode:   roomCode,
 		connCh:     connCh,
 	}

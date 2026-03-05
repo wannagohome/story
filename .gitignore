@@ -1,0 +1,29 @@
+# Binaries (built at repo root)
+/storyserver
+/wsclient
+/story
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Environment
+.env
+.env.local
+
+# Claude
+.claude/*.local.md
