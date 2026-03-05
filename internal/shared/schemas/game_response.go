@@ -215,7 +215,7 @@ func ParseAIGameEvent(data json.RawMessage) (AIGameEvent, error) {
 	case "story_event":
 		var e AIStoryEvent
 		return e, json.Unmarshal(data, &e)
-	case "examine_result":
+	case "examine_result", "examination_result":
 		var e AIExamineResultEvent
 		return e, json.Unmarshal(data, &e)
 	case "action_result":

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/anthropics/story/internal/ai/provider"
 	"github.com/anthropics/story/internal/shared/schemas"
@@ -33,14 +34,20 @@ func (wg *WorldGenerator) Generate(
 		SystemPrompt: worldGenSystemPrompt,
 		UserPrompt:   userPrompt,
 		Temperature:  0.8,
-		MaxTokens:    8000,
+		MaxTokens:    16000,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("world generation AI call failed: %w", err)
 	}
 
+	// Normalize the JSON to fix common AI output quirks before strict parsing.
+	normalized, err := normalizeWorldGenJSON(raw)
+	if err != nil {
+		return nil, fmt.Errorf("world generation normalize failed: %w", err)
+	}
+
 	var result schemas.WorldGeneration
-	if err := json.Unmarshal(raw, &result); err != nil {
+	if err := json.Unmarshal(normalized, &result); err != nil {
 		return nil, fmt.Errorf("world generation parse failed: %w", err)
 	}
 
@@ -83,11 +90,44 @@ func buildWorldGenUserPrompt(playerCount int, themeKeyword string, settings type
 	prompt += fmt.Sprintf(`
 Requirements:
 - Exactly %d player roles with distinct personal goals and secrets
-- At least %d rooms (player_count + 2), fully connected
+- At least %d rooms (player_count + 2), fully connected via bidirectional connections
 - At least %d clues (player_count * 2)
 - At least 1 semi-public information pair
-- A timeout fallback end condition
 - Brief, punchy text suitable for terminal display
+
+Your output MUST be a single JSON object matching this exact structure:
+{
+  "meta": {"theme": "string", "setting": "string", "estimatedDuration": 20, "hasGM": true, "hasNPC": true},
+  "world": {"title": "string (max 24 chars)", "synopsis": "string (2 sentences max)", "atmosphere": "string"},
+  "gameStructure": {
+    "concept": "string", "coreConflict": "string", "progressionStyle": "string",
+    "commonGoal": "string or null", "briefingText": "string (5-7 lines)",
+    "endConditions": [{"id": "string", "description": "string", "triggerType": "timeout|vote|consensus|event|ai_judgment", "triggerCriteria": {}, "isFallback": true}],
+    "winConditions": [{"description": "string", "evaluationCriteria": "string"}],
+    "requiredSystems": ["string"]
+  },
+  "map": {
+    "rooms": [{"id": "room-xxx", "name": "string", "description": "string", "type": "public|private|secret", "items": [], "npcIds": ["npc-xxx"], "clueIds": ["clue-xxx"]}],
+    "connections": [{"roomA": "room-xxx", "roomB": "room-yyy", "bidirectional": true}]
+  },
+  "characters": {
+    "playerRoles": [{"id": "role-xxx", "characterName": "string", "background": "string", "secret": "string", "specialRole": "string or empty",
+      "personalGoals": [{"id": "goal-xxx", "description": "string", "evaluationHint": "string", "entityRefs": []}],
+      "relationships": [{"targetCharacterName": "string", "description": "string"}]}],
+    "npcs": [{"id": "npc-xxx", "name": "string", "currentRoomId": "room-xxx", "persona": "string",
+      "knownInfo": ["string"], "hiddenInfo": ["string"], "behaviorPrinciple": "string", "initialTrust": 0.5, "gimmick": null}]
+  },
+  "clues": [{"id": "clue-xxx", "name": "string", "description": "string", "roomId": "room-xxx", "discoverCondition": "string", "relatedClueIds": []}],
+  "gimmicks": [],
+  "information": {
+    "public": {"title": "string", "synopsis": "string", "characterList": [{"name": "string", "publicDescription": "string"}],
+      "relationships": "string", "mapOverview": "string", "npcList": [{"name": "string", "location": "string"}], "gameRules": "string"},
+    "semiPublic": [{"id": "sp-xxx", "targetPlayerIds": ["role-xxx", "role-yyy"], "content": "string"}],
+    "private": [{"playerId": "role-xxx", "additionalSecrets": ["string"]}]
+  }
+}
+
+CRITICAL: estimatedDuration must be 10-30. At least one endCondition must have "isFallback": true. All roomIds, npcIds, clueIds must cross-reference correctly. semiPublic targetPlayerIds must use role IDs.
 `, playerCount, playerCount+2, playerCount*2)
 
 	return prompt
@@ -105,7 +145,7 @@ func transformToWorld(gen *schemas.WorldGeneration) *types.World {
 			ProgressionStyle:  gen.GameStructure.ProgressionStyle,
 			CommonGoal:        gen.GameStructure.CommonGoal,
 			EstimatedDuration: gen.Meta.EstimatedDuration,
-			BriefingText:      gen.GameStructure.BriefingText,
+			BriefingText:      string(gen.GameStructure.BriefingText),
 		},
 	}
 
@@ -274,4 +314,158 @@ func transformToWorld(gen *schemas.WorldGeneration) *types.World {
 	}
 
 	return world
+}
+
+// normalizeWorldGenJSON fixes common AI output quirks where fields have wrong
+// types (e.g., string instead of array, array instead of string).
+func normalizeWorldGenJSON(raw json.RawMessage) (json.RawMessage, error) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return raw, nil // return as-is, let strict parser handle it
+	}
+
+	// Fix information.public fields
+	if info, ok := data["information"].(map[string]interface{}); ok {
+		if pub, ok := info["public"].(map[string]interface{}); ok {
+			// characterList: ensure it's an array of objects
+			if cl, ok := pub["characterList"]; ok {
+				pub["characterList"] = ensureObjectArray(cl, []string{"name", "publicDescription"})
+			}
+			// npcList: ensure it's an array of objects
+			if nl, ok := pub["npcList"]; ok {
+				pub["npcList"] = ensureObjectArray(nl, []string{"name", "location"})
+			}
+			// Ensure string fields are strings (not arrays)
+			for _, field := range []string{"title", "synopsis", "relationships", "mapOverview", "gameRules"} {
+				pub[field] = ensureString(pub[field])
+			}
+		}
+		// Ensure semiPublic exists as array
+		if _, ok := info["semiPublic"]; !ok {
+			info["semiPublic"] = []interface{}{}
+		}
+		// Ensure private exists as array
+		if _, ok := info["private"]; !ok {
+			info["private"] = []interface{}{}
+		}
+	}
+
+	// Fix world fields
+	if w, ok := data["world"].(map[string]interface{}); ok {
+		for _, field := range []string{"title", "synopsis", "atmosphere"} {
+			w[field] = ensureString(w[field])
+		}
+	}
+
+	// Fix gameStructure fields
+	if gs, ok := data["gameStructure"].(map[string]interface{}); ok {
+		for _, field := range []string{"concept", "coreConflict", "progressionStyle"} {
+			gs[field] = ensureString(gs[field])
+		}
+	}
+
+	// Fix meta.estimatedDuration: ensure it's at least 10
+	if meta, ok := data["meta"].(map[string]interface{}); ok {
+		if dur, ok := meta["estimatedDuration"].(float64); ok && dur < 10 {
+			meta["estimatedDuration"] = 15.0
+		}
+		if _, ok := meta["estimatedDuration"]; !ok {
+			meta["estimatedDuration"] = 20.0
+		}
+	}
+
+	// Fix gameStructure.endConditions: ensure at least one with isFallback
+	if gs, ok := data["gameStructure"].(map[string]interface{}); ok {
+		endConds, _ := gs["endConditions"].([]interface{})
+		if len(endConds) == 0 {
+			gs["endConditions"] = []interface{}{
+				map[string]interface{}{
+					"id":              "end-timeout",
+					"description":     "Game times out",
+					"triggerType":     "timeout",
+					"triggerCriteria": map[string]interface{}{},
+					"isFallback":      true,
+				},
+			}
+		} else {
+			// Ensure at least one has isFallback
+			hasFallback := false
+			for _, ec := range endConds {
+				if ecMap, ok := ec.(map[string]interface{}); ok {
+					if fb, ok := ecMap["isFallback"].(bool); ok && fb {
+						hasFallback = true
+						break
+					}
+				}
+			}
+			if !hasFallback {
+				// Mark the last one as fallback
+				if lastEC, ok := endConds[len(endConds)-1].(map[string]interface{}); ok {
+					lastEC["isFallback"] = true
+				}
+			}
+		}
+	}
+
+	return json.Marshal(data)
+}
+
+// ensureString coerces a value to a string. Arrays of strings are joined with newlines.
+func ensureString(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case []interface{}:
+		var parts []string
+		for _, elem := range val {
+			if s, ok := elem.(string); ok {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		if v == nil {
+			return ""
+		}
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// ensureObjectArray ensures a value is an array of objects with the given fields.
+// Handles: string → [{field[0]: string}], ["s1","s2"] → [{field[0]: "s1"}, ...],
+// [obj1, obj2] → as-is.
+func ensureObjectArray(v interface{}, fields []string) interface{} {
+	makeObj := func(name string) map[string]interface{} {
+		obj := map[string]interface{}{fields[0]: name}
+		for _, f := range fields[1:] {
+			obj[f] = ""
+		}
+		return obj
+	}
+
+	switch val := v.(type) {
+	case []interface{}:
+		// Check if elements are strings and convert to objects
+		result := make([]interface{}, 0, len(val))
+		for _, elem := range val {
+			switch e := elem.(type) {
+			case string:
+				if len(fields) > 0 {
+					result = append(result, makeObj(e))
+				}
+			case map[string]interface{}:
+				result = append(result, e)
+			default:
+				result = append(result, elem)
+			}
+		}
+		return result
+	case string:
+		if len(fields) > 0 {
+			return []interface{}{makeObj(val)}
+		}
+		return []interface{}{}
+	default:
+		return []interface{}{}
+	}
 }

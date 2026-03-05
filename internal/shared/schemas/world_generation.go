@@ -1,6 +1,10 @@
 package schemas
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 type ItemSchema struct {
 	ID          string  `json:"id"`
@@ -112,7 +116,24 @@ type WorldGenerationGameStructure struct {
 	EndConditions    []EndConditionSchema `json:"endConditions"`
 	WinConditions    []WinConditionSchema `json:"winConditions"`
 	RequiredSystems  []string             `json:"requiredSystems"`
-	BriefingText     string               `json:"briefingText"`
+	BriefingText     FlexString           `json:"briefingText"`
+}
+
+// FlexString accepts both a JSON string and an array of strings (joined with newlines).
+type FlexString string
+
+func (f *FlexString) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*f = FlexString(s)
+		return nil
+	}
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*f = FlexString(strings.Join(arr, "\n"))
+		return nil
+	}
+	return fmt.Errorf("briefingText: expected string or []string, got %s", string(data))
 }
 
 func (g *WorldGenerationGameStructure) Validate() error {
