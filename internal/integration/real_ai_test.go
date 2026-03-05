@@ -463,6 +463,198 @@ func TestRealAIProviderHealthCheck(t *testing.T) {
 	}
 }
 
+// TestRealAIMultiPlayerGameplay tests full game flow with varying player counts (3, 4, 5).
+func TestRealAIMultiPlayerGameplay(t *testing.T) {
+	if os.Getenv("STORY_REAL_AI_TEST") != "1" {
+		t.Skip("set STORY_REAL_AI_TEST=1 to run real AI tests")
+	}
+
+	apiKey := getAPIKeyFromDoppler("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		t.Skip("ANTHROPIC_API_KEY not available from Doppler")
+	}
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
+	testCases := []struct {
+		name       string
+		numPlayers int
+		theme      string
+	}{
+		{"3players", 3, "haunted castle"},
+		{"4players", 4, "pirate ship mystery"},
+		{"5players", 5, "space colony sabotage"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := provider.NewProviderFromConfig(provider.ProviderConfig{
+				Type:   "anthropic",
+				APIKey: apiKey,
+				Model:  "claude-sonnet-4-20250514",
+			})
+			if err != nil {
+				t.Fatalf("failed to create provider: %v", err)
+			}
+			realAI := ai.NewAILayerWithProvider(p)
+			stack := buildRealAIStack(t, realAI)
+			defer stack.net.Stop()
+
+			// Connect N players
+			type playerConn struct {
+				conn     *websocket.Conn
+				playerID string
+				name     string
+			}
+			players := make([]playerConn, tc.numPlayers)
+			for i := 0; i < tc.numPlayers; i++ {
+				name := fmt.Sprintf("Player%d", i+1)
+				conn, pid := stack.connectPlayer(t, name)
+				defer conn.Close()
+				players[i] = playerConn{conn: conn, playerID: pid, name: name}
+				t.Logf("Connected %s (ID: %s)", name, pid)
+			}
+
+			// Start game (host = first player)
+			t.Logf("Starting %d-player game with theme %q...", tc.numPlayers, tc.theme)
+			if err := stack.sessionMgr.StartGame(players[0].playerID, tc.theme); err != nil {
+				t.Fatalf("StartGame failed: %v", err)
+			}
+
+			// Wait for briefing on first player
+			if waitForMsgRealAI(players[0].conn, "briefing_public", 120*time.Second) == nil {
+				t.Fatal("player 0 did not receive briefing_public")
+			}
+			t.Log("Briefings received")
+
+			// Wait for all players to get briefing_private
+			for i, pc := range players {
+				if i > 0 {
+					waitForMsgRealAI(pc.conn, "briefing_public", 10*time.Second)
+				}
+				if waitForMsgRealAI(pc.conn, "briefing_private", 10*time.Second) == nil {
+					t.Fatalf("player %d did not receive briefing_private", i)
+				}
+			}
+
+			// All players ready
+			for _, pc := range players {
+				stack.sessionMgr.MarkPlayerReady(pc.playerID)
+			}
+
+			if waitForMsgRealAI(players[0].conn, "game_started", 10*time.Second) == nil {
+				t.Fatal("game_started not received")
+			}
+			t.Log("Game started!")
+
+			world := stack.gameState.GetWorld()
+			stack.mapEng.Initialize(world.Map)
+			t.Logf("World: %q, %d rooms, %d roles, %d NPCs, %d clues",
+				world.Title, len(world.Map.Rooms), len(world.PlayerRoles),
+				len(world.NPCs), len(world.Clues))
+
+			if len(world.PlayerRoles) < tc.numPlayers {
+				t.Errorf("expected at least %d player roles, got %d", tc.numPlayers, len(world.PlayerRoles))
+			}
+
+			// Each player takes actions in parallel
+			var wg sync.WaitGroup
+			for i, pc := range players {
+				wg.Add(1)
+				go func(idx int, pc playerConn) {
+					defer wg.Done()
+
+					// Chat
+					t.Logf("[%s] Chatting", pc.name)
+					stack.actionProc.ProcessMessage(pc.playerID, protocol.ClientMessage{
+						Type:    "chat",
+						Content: fmt.Sprintf("I'm %s, ready to investigate!", pc.name),
+					})
+					time.Sleep(500 * time.Millisecond)
+
+					// Examine
+					t.Logf("[%s] Examining", pc.name)
+					stack.actionProc.ProcessMessage(pc.playerID, protocol.ClientMessage{
+						Type: "examine",
+					})
+					waitForMsgRealAI(pc.conn, "game_event", 30*time.Second)
+
+					// Move to adjacent room
+					currentRoom := stack.gameState.GetPlayerRoom(pc.playerID)
+					if currentRoom != nil {
+						adjRooms := stack.mapEng.GetAdjacentRooms(currentRoom.ID)
+						if len(adjRooms) > 0 {
+							// Pick a different room per player to spread them out
+							targetIdx := idx % len(adjRooms)
+							t.Logf("[%s] Moving to %s", pc.name, adjRooms[targetIdx].Name)
+							stack.actionProc.ProcessMessage(pc.playerID, protocol.ClientMessage{
+								Type:         "move",
+								TargetRoomID: adjRooms[targetIdx].ID,
+							})
+							waitForMsgRealAI(pc.conn, "room_changed", 5*time.Second)
+						}
+					}
+
+					// Talk to NPC if available
+					if len(world.NPCs) > 0 {
+						npc := world.NPCs[idx%len(world.NPCs)]
+						t.Logf("[%s] Talking to NPC %s", pc.name, npc.Name)
+						stack.actionProc.ProcessMessage(pc.playerID, protocol.ClientMessage{
+							Type:    "talk",
+							NPCID:   npc.ID,
+							Message: fmt.Sprintf("Hello %s, what happened here?", npc.Name),
+						})
+						waitForMsgRealAI(pc.conn, "game_event", 30*time.Second)
+					}
+				}(i, pc)
+			}
+			wg.Wait()
+			t.Log("All player actions completed")
+
+			// Propose end
+			stack.actionProc.ProcessMessage(players[0].playerID, protocol.ClientMessage{Type: "propose_end"})
+			time.Sleep(500 * time.Millisecond)
+
+			// All other players vote to end
+			for _, pc := range players[1:] {
+				stack.actionProc.ProcessMessage(pc.playerID, protocol.ClientMessage{
+					Type:  "end_vote",
+					Agree: true,
+				})
+			}
+
+			// Wait for game to finish
+			t.Log("Waiting for game ending...")
+			endTimeout := time.After(120 * time.Second)
+			gotFinished := false
+			for !gotFinished {
+				select {
+				case <-endTimeout:
+					t.Log("Warning: game_finished not received within timeout")
+					gotFinished = true
+				default:
+					msg := readMsgRealAI(players[0].conn, 5*time.Second)
+					if msg == nil {
+						continue
+					}
+					msgType, _ := msg["type"].(string)
+					if msgType == "game_finished" {
+						gotFinished = true
+						t.Log("Game finished!")
+					}
+				}
+			}
+
+			// Verify game status
+			status := stack.sessionMgr.GetGameStatus()
+			if status != types.GameStatusFinished {
+				t.Errorf("expected game status 'finished', got %q", status)
+			}
+			t.Logf("L4 %d-player test completed (status: %s)", tc.numPlayers, status)
+		})
+	}
+}
+
 // TestSubagentPlayTest simulates two AI "agents" playing the game concurrently.
 func TestSubagentPlayTest(t *testing.T) {
 	if os.Getenv("STORY_REAL_AI_TEST") != "1" {
