@@ -20,10 +20,18 @@ type NetworkConfig struct {
 	Port int
 }
 
+// connEntry pairs a WebSocket connection with its write mutex.
+// gorilla/websocket requires that concurrent writes to the same connection
+// are serialized; writeMu enforces this guarantee.
+type connEntry struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
 // NetworkServer manages WebSocket connections and message routing.
 type NetworkServer struct {
 	upgrader      websocket.Upgrader
-	clients       map[string]*websocket.Conn
+	clients       map[string]*connEntry
 	mu            sync.RWMutex
 	config        NetworkConfig
 	server        *http.Server
@@ -38,7 +46,7 @@ func NewNetworkServer(config NetworkConfig) *NetworkServer {
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		clients: make(map[string]*websocket.Conn),
+		clients: make(map[string]*connEntry),
 		config:  config,
 	}
 }
@@ -89,7 +97,7 @@ func (ns *NetworkServer) OnMessage(handler func(playerId string, msg protocol.Cl
 // SendTo sends a JSON message to a specific player.
 func (ns *NetworkServer) SendTo(playerId string, msg interface{}) {
 	ns.mu.RLock()
-	conn, ok := ns.clients[playerId]
+	entry, ok := ns.clients[playerId]
 	ns.mu.RUnlock()
 	if !ok {
 		slog.Warn("network: player not found for SendTo", "playerId", playerId)
@@ -102,7 +110,10 @@ func (ns *NetworkServer) SendTo(playerId string, msg interface{}) {
 		return
 	}
 
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	entry.writeMu.Lock()
+	err = entry.conn.WriteMessage(websocket.TextMessage, data)
+	entry.writeMu.Unlock()
+	if err != nil {
 		slog.Error("network: failed to send message", "playerId", playerId, "error", err)
 	}
 }
@@ -115,16 +126,22 @@ func (ns *NetworkServer) SendToMany(playerIds []string, msg interface{}) {
 		return
 	}
 
+	// Snapshot entries under the read lock to avoid holding it during I/O.
 	ns.mu.RLock()
-	defer ns.mu.RUnlock()
-
+	entries := make([]*connEntry, 0, len(playerIds))
 	for _, id := range playerIds {
-		conn, ok := ns.clients[id]
-		if !ok {
-			continue
+		if entry, ok := ns.clients[id]; ok {
+			entries = append(entries, entry)
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			slog.Error("network: failed to send message", "playerId", id, "error", err)
+	}
+	ns.mu.RUnlock()
+
+	for _, entry := range entries {
+		entry.writeMu.Lock()
+		writeErr := entry.conn.WriteMessage(websocket.TextMessage, data)
+		entry.writeMu.Unlock()
+		if writeErr != nil {
+			slog.Error("network: failed to send message", "error", writeErr)
 		}
 	}
 }
@@ -137,12 +154,22 @@ func (ns *NetworkServer) SendToAll(msg interface{}) {
 		return
 	}
 
+	// Snapshot entries under the read lock to avoid holding it during I/O.
 	ns.mu.RLock()
-	defer ns.mu.RUnlock()
+	entries := make([]*connEntry, 0, len(ns.clients))
+	ids := make([]string, 0, len(ns.clients))
+	for id, entry := range ns.clients {
+		entries = append(entries, entry)
+		ids = append(ids, id)
+	}
+	ns.mu.RUnlock()
 
-	for id, conn := range ns.clients {
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			slog.Error("network: failed to send message", "playerId", id, "error", err)
+	for i, entry := range entries {
+		entry.writeMu.Lock()
+		writeErr := entry.conn.WriteMessage(websocket.TextMessage, data)
+		entry.writeMu.Unlock()
+		if writeErr != nil {
+			slog.Error("network: failed to send message", "playerId", ids[i], "error", writeErr)
 		}
 	}
 }
@@ -151,7 +178,7 @@ func (ns *NetworkServer) SendToAll(msg interface{}) {
 func (ns *NetworkServer) BindPlayerToSocket(playerId string, conn *websocket.Conn) {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
-	ns.clients[playerId] = conn
+	ns.clients[playerId] = &connEntry{conn: conn}
 }
 
 // UnbindPlayer removes the association between a player ID and its WebSocket connection.
@@ -187,8 +214,8 @@ func (ns *NetworkServer) readLoop(conn *websocket.Conn) {
 	findPlayerID := func() string {
 		ns.mu.RLock()
 		defer ns.mu.RUnlock()
-		for id, c := range ns.clients {
-			if c == conn {
+		for id, e := range ns.clients {
+			if e.conn == conn {
 				return id
 			}
 		}
