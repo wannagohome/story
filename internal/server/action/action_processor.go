@@ -75,7 +75,7 @@ func (ap *ActionProcessor) ProcessMessage(playerID string, msg protocol.ClientMe
 		return ap.handleVote(playerID, msg)
 	case "solve":
 		return ap.handleSolve(playerID, msg)
-	case "propose_end":
+	case "propose_end", "end_propose":
 		return ap.handleProposeEnd(playerID)
 	case "end_vote":
 		return ap.handleEndVote(playerID, msg)
