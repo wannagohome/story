@@ -20,7 +20,7 @@ import (
 	"github.com/anthropics/story/internal/shared/types"
 )
 
-const aiTimeout = 5 * time.Second
+const aiTimeout = 15 * time.Second
 
 // ActionProcessor handles game-time player commands.
 type ActionProcessor struct {
